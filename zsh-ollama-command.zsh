@@ -1,109 +1,101 @@
-# default shortcut as Ctrl-o
+#!/bin/zsh
+
+# Default hotkey: Ctrl+O
 (( ! ${+ZSH_OLLAMA_COMMANDS_HOTKEY} )) && typeset -g ZSH_OLLAMA_COMMANDS_HOTKEY='^o'
-# default ollama model as llama3
+# Default Ollama model
 (( ! ${+ZSH_OLLAMA_MODEL} )) && typeset -g ZSH_OLLAMA_MODEL='llama3'
-# default response number as 5
+# Default number of command suggestions
 (( ! ${+ZSH_OLLAMA_COMMANDS} )) && typeset -g ZSH_OLLAMA_COMMANDS='5'
-# default ollama server host
+# Default Ollama server URL
 (( ! ${+ZSH_OLLAMA_URL} )) && typeset -g ZSH_OLLAMA_URL='http://localhost:11434'
 
 validate_required() {
-  # check required tools are installed
-  if (( ! $+commands[jq] )) then
-      echo "🚨: zsh-ollama-command failed as jq NOT found!"
-      echo "Please install it with 'brew install jq'"
-      return 1;
-  fi
-  if (( ! $+commands[fzf] )) then
-      echo "🚨: zsh-ollama-command failed as fzf NOT found!"
-      echo "Please install it with 'brew install fzf'"
-      return 1;
-  fi
-  if (( ! $+commands[curl] )) then
-      echo "🚨: zsh-ollama-command failed as curl NOT found!"
-      echo "Please install it with 'brew install curl'"
-      return 1;
-  fi
-  if ! (( $(pgrep -f ollama | wc -l ) > 0 )); then
-    echo "🚨: zsh-ollama-command failed as OLLAMA server NOT running!"
-    echo "Please start it with 'brew services start ollama'"
-    return 1;
-  fi
-  if ! curl -s "${ZSH_OLLAMA_URL}/api/tags" | grep -q $ZSH_OLLAMA_MODEL; then
-    echo "🚨: zsh-ollama-command failed as model ${ZSH_OLLAMA_MODEL} server NOT found!"
-    echo "Please start it with 'ollama pull ${ZSH_OLLAMA_MODEL}' or adjust ZSH_OLLAMA_MODEL"
-    return 1;
-  fi
-}
+  # Check if required tools are installed
+  for cmd in jq fzf curl; do
+    if ! command -v $cmd &>/dev/null; then
+      echo "🚨 zsh-ollama-command failed: '$cmd' is not installed!"
+      echo "Please install it with: brew install $cmd"
+      return 1
+    fi
+  done
 
-check_status() {
-  tput cuu 1 # cleanup waiting message
-  if [ $? -ne 0 ]; then
-    echo "༼ つ ◕_◕ ༽つ Sorry! Please try again..."
-    exit 1
+  # Check if Ollama server is running
+  if ! pgrep -f ollama &>/dev/null; then
+    echo "🚨 Ollama server is NOT running!"
+    echo "Start it with: brew services start ollama"
+    return 1
+  fi
+
+  # Check if the specified model is available
+  if ! curl -s "${ZSH_OLLAMA_URL}/api/tags" | grep -q "$ZSH_OLLAMA_MODEL"; then
+    echo "🚨 Model '$ZSH_OLLAMA_MODEL' not found on Ollama server!"
+    echo "Try: ollama pull $ZSH_OLLAMA_MODEL"
+    return 1
   fi
 }
 
 fzf_ollama_commands() {
   setopt extendedglob
-  validate_required
-  if [ $? -eq 1 ]; then
+  validate_required || return 1
+
+  ZSH_OLLAMA_COMMANDS_USER_QUERY=$BUFFER
+  zle end-of-line
+  zle reset-prompt
+  print
+  print -u1 "👻 Please wait..."
+
+  ZSH_OLLAMA_COMMANDS_MESSAGE_CONTENT="Seeking ZSH terminal commands for MacOS 15.2 for the following task: $ZSH_OLLAMA_COMMANDS_USER_QUERY. Reply with possible commands, each on its own line. Response only contains raw commands to execute, no any additional description. No additional text should be present. If the task need more than one command then chain or pipe them. Provide AT MOST $ZSH_OLLAMA_COMMANDS command suggestions."
+
+  ZSH_OLLAMA_COMMANDS_REQUEST_BODY=$(cat <<EOF
+{
+  "model": "$ZSH_OLLAMA_MODEL",
+  "messages": [
+    {
+      "role": "user",
+      "content": "$ZSH_OLLAMA_COMMANDS_MESSAGE_CONTENT"
+    }
+  ],
+  "stream": false
+}
+EOF
+  )
+
+  ZSH_OLLAMA_COMMANDS_RESPONSE=$(curl --silent --fail "${ZSH_OLLAMA_URL}/api/chat" \
+    -H "Content-Type: application/json" \
+    -d "$ZSH_OLLAMA_COMMANDS_REQUEST_BODY")
+
+  # If curl failed, display the raw response
+  if [[ $? -ne 0 || -z "$ZSH_OLLAMA_COMMANDS_RESPONSE" ]]; then
+    echo "🚨 API request failed. Showing raw response:"
+    echo "$ZSH_OLLAMA_COMMANDS_RESPONSE"
     return 1
   fi
 
-  ZSH_OLLAMA_COMMANDS_USER_QUERY=$BUFFER
+  # Extracting commands using patterns
+  COMMANDS=$(echo "$ZSH_OLLAMA_COMMANDS_RESPONSE" | sed -E 's/```[a-z]+//g' | sed -E 's/```//g' | sed 's/^\s*//g' | grep -E '^\w+ .+')
 
-  zle end-of-line
-  zle reset-prompt
+  # If no valid commands were extracted, show raw response
+  if [[ -z "$COMMANDS" ]]; then
+    echo "🚨 No valid commands found. Raw response:"
+    echo "$ZSH_OLLAMA_COMMANDS_RESPONSE"
+    return 1
+  fi
 
-  print
-  print -u1 "👻Please wait..."
+  # Remove duplicate empty lines or non-command lines
+  COMMANDS=$(echo "$COMMANDS" | awk 'NF')
 
-  ZSH_OLLAMA_COMMANDS_MESSAGE_CONTENT="Seeking OLLAMA for MacOS terminal commands for the following task: $ZSH_OLLAMA_COMMANDS_USER_QUERY. Reply with an array without newlines consisting solely of possible commands. The format would be like: ['command1; comand2;', 'command3&comand4;']. Response only contains array, no any additional description. No additional text should be present in each entry and commands, remove empty string entry. Each string entry should be a new string entry. If the task need more than one command, combine them in one string entry. Each string entry should only contain the command(s). Do not include empty entry. Provide multiple entry (at most $ZSH_OLLAMA_COMMANDS relevant entry) in response Json suggestions if available. Please ensure response can be parsed by jq"
+  # Display selection menu with fzf
+  ZSH_OLLAMA_COMMANDS_SELECTED=$(echo "$COMMANDS" | fzf --prompt="Select a command: ")
 
-  ZSH_OLLAMA_COMMANDS_REQUEST_BODY='{
-    "model": "'$ZSH_OLLAMA_MODEL'",
-    "messages": [
-      {
-        "role": "user",
-        "content":  "'$ZSH_OLLAMA_COMMANDS_MESSAGE_CONTENT'"
-      }
-    ],
-    "stream": false
-  }'
-
-  ZSH_OLLAMA_COMMANDS_RESPONSE=$(curl --silent "${ZSH_OLLAMA_URL}/api/chat" \
-    -H "Content-Type: application/json" \
-    -d "$ZSH_OLLAMA_COMMANDS_REQUEST_BODY")
-  local ret=$?
-
-  # trim response content newline
-  ZSH_OLLAMA_COMMANDS_SUGGESTION=$(echo $ZSH_OLLAMA_COMMANDS_RESPONSE | tr -d '\n\r' | tr -d '\0' | jq '.')
-  check_status
-
-  # collect suggestion commands from response content
-  ZSH_OLLAMA_COMMANDS_SUGGESTION=$(echo "$ZSH_OLLAMA_COMMANDS_SUGGESTION" | tr -d '\0' | jq -r '.message.content')
-  check_status
-
-  # attempts to extract suggestions from ZSH_OLLAMA_COMMANDS_SUGGESTION using jq.
-  # If jq fails or returns no output, displays an error message and exits.
-  # Otherwise, pipes the output to fzf for interactive selection
-  ZSH_OLLAMA_COMMANDS_SELECTED=$(echo $ZSH_OLLAMA_COMMANDS_SUGGESTION | tr -d '\0' | jq -r '.[]')
-  check_status
-
-  tput cuu 1 # cleanup waiting message
-
-  ZSH_OLLAMA_COMMANDS_SELECTED=$(echo $ZSH_OLLAMA_COMMANDS_SUGGESTION | jq -r '.[]' | fzf --ansi --height=~10 --cycle)
-  BUFFER=$ZSH_OLLAMA_COMMANDS_SELECTED
-
-  zle end-of-line
-  zle reset-prompt
-  return $ret
+  if [[ -n "$ZSH_OLLAMA_COMMANDS_SELECTED" ]]; then
+    BUFFER=$ZSH_OLLAMA_COMMANDS_SELECTED
+    zle end-of-line
+    zle reset-prompt
+  fi
 }
 
 validate_required
 
 autoload fzf_ollama_commands
 zle -N fzf_ollama_commands
-
 bindkey $ZSH_OLLAMA_COMMANDS_HOTKEY fzf_ollama_commands
